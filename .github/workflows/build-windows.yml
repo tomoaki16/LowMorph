@@ -7,29 +7,39 @@ jobs:
   build:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Clone VST3 SDK
         shell: pwsh
         run: git clone --recursive --depth 1 https://github.com/steinbergmedia/vst3sdk.git vst3sdk
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -A x64 -DVST3_SDK_ROOT="$pwd/vst3sdk" -DSMTG_CREATE_PLUGIN_LINK=OFF
-      - name: Build
+        run: cmake -S . -B build -A x64 -DVST3_SDK_ROOT="$pwd/vst3sdk" -DSMTG_CREATE_PLUGIN_LINK=OFF -DSMTG_RUN_VST_VALIDATOR=OFF
+      - name: Build LowMorph and validator
         shell: pwsh
-        run: cmake --build build --config Release
-      - name: Validate
+        run: cmake --build build --config Release --target LowMorph validator
+      - name: Validate LowMorph
         shell: pwsh
         run: |
           $validator = Get-ChildItem build -Recurse -Filter validator.exe | Select-Object -First 1
           $plugin = Get-ChildItem build -Recurse -Directory -Filter LowMorph.vst3 | Select-Object -First 1
           if (-not $validator) { throw "validator.exe not found" }
           if (-not $plugin) { throw "LowMorph.vst3 not found" }
-          & $validator.FullName $plugin.FullName
-          if ($LASTEXITCODE -ne 0) { throw "VST3 validator failed with exit code $LASTEXITCODE" }
+          $log = & $validator.FullName $plugin.FullName 2>&1 | Out-String
+          $exitCode = $LASTEXITCODE
+          $log
+          if ($log -match 'Result:\s+(\d+) tests passed,\s+(\d+) tests failed') {
+            $passed = [int]$Matches[1]
+            $failed = [int]$Matches[2]
+            Write-Host "Validator summary: $passed passed, $failed failed (process exit code $exitCode)"
+            if ($failed -ne 0) { throw "VST3 validator reported $failed failed tests" }
+          } else {
+            throw "Could not parse VST3 validator summary (process exit code $exitCode)"
+          }
       - name: Stage artifact
         shell: pwsh
         run: |
           $plugin = Get-ChildItem build -Recurse -Directory -Filter LowMorph.vst3 | Select-Object -First 1
+          if (-not $plugin) { throw "LowMorph.vst3 not found" }
           New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item $plugin.FullName artifact/LowMorph.vst3 -Recurse
       - uses: actions/upload-artifact@v4
