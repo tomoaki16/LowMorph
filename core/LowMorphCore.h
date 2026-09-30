@@ -1,7 +1,7 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <vector>
 
 namespace lowmorph {
 
@@ -13,146 +13,152 @@ struct Params {
 class Core {
     double sr=48000.0;
     Params p{};
-    std::vector<float> hist;
-    size_t w=0;
-    int hop=0;
 
-    float env=0.f, fastEnv=0.f, slowEnv=0.f, prevFast=0.f;
-    float hz=41.2f, target=41.2f, lp=0.f;
+    // Continuous input analysis. No look-ahead/windowed autocorrelation.
+    float inLP1=0.f, inLP2=0.f;
+    float env=0.f, fast=0.f, slow=0.f, prevFast=0.f;
+    bool edgeHigh=false;
+    int edgeSamples=0;
+    std::array<int,3> periods{{0,0,0}};
+    int periodPos=0, periodCount=0;
+    float guitarHz=82.4f, bassHz=41.2f, targetHz=41.2f;
+    bool havePitch=false;
+
+    // Previous-version additive bass voice retained as the sound generator.
     double phase[8]{};
     float amp[8]{};
-
-    int retriggerSamples=0;
-    int silenceSamples=0;
-    bool voiceActive=false;
+    float masterGain=0.f;
+    float lp=0.f;
+    float dcX=0.f, dcY=0.f;
 
     static float clamp(float x,float a,float b){ return std::max(a,std::min(b,x)); }
+    static float median3(float a,float b,float c){
+        if(a>b) std::swap(a,b); if(b>c) std::swap(b,c); if(a>b) std::swap(a,b); return b;
+    }
 
-    void analyse() {
-        const int N=(int)hist.size();
-        const int lo=(int)(sr/400.0);
-        const int hi=std::min((int)(sr/70.0),N/2);
-        int bestLag=lo;
-        float best=-1.f;
-        for(int lag=lo;lag<=hi;++lag){
-            double xy=0,xx=0,yy=0;
-            for(int j=0;j<N-lag;++j){
-                const float a=hist[(w+j)%N], b=hist[(w+j+lag)%N];
-                xy+=a*b; xx+=a*a; yy+=b*b;
+    void trackPitch(float x){
+        constexpr double pi=3.14159265358979323846;
+        const float fc=420.f;
+        const float a=1.f-(float)std::exp(-2.0*pi*fc/sr);
+        inLP1 += a*(x-inLP1);
+        inLP2 += a*(inLP1-inLP2);
+        ++edgeSamples;
+
+        const float threshold=std::max(.0012f, env*.10f);
+        if(!edgeHigh && inLP2>threshold){
+            edgeHigh=true;
+            const int period=edgeSamples;
+            edgeSamples=0;
+            const int minP=(int)(sr/430.0);
+            const int maxP=(int)(sr/65.0);
+            if(period>=minP && period<=maxP){
+                periods[periodPos]=period;
+                periodPos=(periodPos+1)%3;
+                periodCount=std::min(3,periodCount+1);
+                if(periodCount>=2){
+                    float per=(float)periods[(periodPos+2)%3];
+                    if(periodCount==3) per=median3((float)periods[0],(float)periods[1],(float)periods[2]);
+                    const float candidate=(float)(sr/per);
+                    if(!havePitch || (candidate>guitarHz*.72f && candidate<guitarHz*1.38f)){
+                        guitarHz=candidate;
+                        targetHz=clamp(candidate*.5f,35.f,220.f);
+                        havePitch=true;
+                    }
+                }
             }
-            const float c=(float)(xy/(std::sqrt(xx*yy)+1e-12));
-            if(c>best){ best=c; bestLag=lag; }
+        } else if(edgeHigh && inLP2 < -threshold){
+            edgeHigh=false;
         }
-        if(best>.55f)
-            target=clamp((float)(sr/bestLag)*.5f,35.f,220.f);
-    }
-
-    void trigger(float strength) {
-        static constexpr float A[8]={1.f,.58f,.39f,.27f,.19f,.13f,.09f,.06f};
-        const float v=clamp(strength, .10f, 1.f);
-        // A new pick replaces the previous excitation instead of waiting for the old note to decay.
-        for(int k=0;k<8;++k) amp[k]=v*A[k];
-        voiceActive=true;
-        silenceSamples=0;
-        retriggerSamples=(int)(sr*.018); // only reject double-triggering inside ~18 ms
-    }
-
-    void choke() {
-        // Guitar mute should stop the synthetic string too; do not leave autonomous oscillators ringing.
-        for(float &a : amp) a*=0.82f;
-        lp*=0.82f;
-        bool alive=false;
-        for(float a : amp) if(a>1e-5f){ alive=true; break; }
-        if(!alive){
-            std::fill(amp,amp+8,0.f);
-            lp=0.f;
-            voiceActive=false;
+        if(edgeSamples>(int)(sr*.075)) {
+            edgeSamples=(int)(sr*.075);
+            periodCount=0;
         }
     }
 
 public:
-    void prepare(double s){ sr=s; hist.assign((size_t)(sr*.045),0.f); reset(); }
+    void prepare(double s){ sr=s; reset(); }
 
     void reset(){
-        std::fill(hist.begin(),hist.end(),0.f);
-        w=0; hop=0;
-        env=fastEnv=slowEnv=prevFast=0.f;
-        hz=target=41.2f; lp=0.f;
-        retriggerSamples=silenceSamples=0;
-        voiceActive=false;
-        std::fill(phase,phase+8,0.0);
-        std::fill(amp,amp+8,0.f);
+        inLP1=inLP2=env=fast=slow=prevFast=0.f;
+        edgeHigh=false; edgeSamples=0; periods={{0,0,0}}; periodPos=periodCount=0;
+        guitarHz=82.4f; bassHz=targetHz=41.2f; havePitch=false;
+        std::fill(phase,phase+8,0.0); std::fill(amp,amp+8,0.f);
+        masterGain=lp=dcX=dcY=0.f;
     }
 
     void set(const Params&v){ p=v; }
-    float detectedHz()const{return hz;}
+    float detectedHz()const{return bassHz;}
 
-    void process(const float*in,float*out,int n){
+    void process(const float* in,float* out,int n){
+        static constexpr float H[8]={1.f,.58f,.39f,.27f,.19f,.13f,.09f,.06f};
         constexpr double pi=3.14159265358979323846;
-        const float envAttack=std::exp(-1.f/(.0015f*(float)sr));
-        const float envRelease=std::exp(-1.f/(.028f*(float)sr));
-        const float fastCoef=std::exp(-1.f/(.0007f*(float)sr));
-        const float slowCoef=std::exp(-1.f/(.018f*(float)sr));
-        const int muteHold=(int)(sr*.012); // require ~12 ms of near-silence before choking
+
+        const float envAttack=1.f-(float)std::exp(-1.0/(.0015*sr));
+        const float envRelease=1.f-(float)std::exp(-1.0/(.055*sr));
+        const float fastCoef=1.f-(float)std::exp(-1.0/(.00065*sr));
+        const float slowCoef=1.f-(float)std::exp(-1.0/(.025*sr));
+        const float gainAttack=1.f-(float)std::exp(-1.0/(.0025*sr));
+        const float gainRelease=1.f-(float)std::exp(-1.0/(.045*sr));
+        const float pitchCoef=1.f-(float)std::exp(-1.0/(.006*sr));
 
         for(int i=0;i<n;++i){
-            const float x=in[i];
-            hist[w]=x; w=(w+1)%hist.size();
-            const float q=std::fabs(x);
+            const float x=in[i], q=std::fabs(x);
+            env += (q>env?envAttack:envRelease)*(q-env);
+            fast += fastCoef*(q-fast);
+            slow += slowCoef*(q-slow);
+            const float slope=fast-prevFast;
+            prevFast=fast;
 
-            env = q>env ? envAttack*env+(1-envAttack)*q
-                        : envRelease*env+(1-envRelease)*q;
-            fastEnv = fastCoef*fastEnv+(1-fastCoef)*q;
-            slowEnv = slowCoef*slowEnv+(1-slowCoef)*q;
+            trackPitch(x);
+            if(havePitch) bassHz += pitchCoef*(targetHz-bassHz);
 
-            // Attack detector: respond to the positive transient slope, not the residual note envelope.
-            const float slope=fastEnv-prevFast;
-            prevFast=fastEnv;
-            if(retriggerSamples>0) --retriggerSamples;
-
-            const float dynamicThreshold=std::max(.0025f, slowEnv*.08f);
-            const bool transient = slope>dynamicThreshold && fastEnv>std::max(.006f, slowEnv*1.06f);
-            if(transient && retriggerSamples==0)
-                trigger(clamp(fastEnv*8.f,.10f,1.f));
-
-            if(++hop>=std::max(1,(int)(sr*.006))){
-                hop=0;
-                if(env>.004f) analyse();
+            // A pick adds/rebalances harmonic energy, but never hard-resets the output.
+            const float onsetThreshold=std::max(.00035f,slow*.020f);
+            if(slope>onsetThreshold && fast>std::max(.0025f,slow*1.02f)){
+                const float velocity=clamp(fast*7.5f,.08f,1.f);
+                for(int k=0;k<8;++k){
+                    const float desired=velocity*H[k];
+                    amp[k]=std::max(amp[k],desired);
+                }
             }
-            hz += .006f*(target-hz);
 
-            // Detect a real left-hand/right-hand mute from the DI input.
-            if(q<.0012f && env<.0045f) ++silenceSamples;
-            else silenceSamples=0;
-            if(voiceActive && silenceSamples>muteHold) choke();
+            // Continuous amplitude follows the player's actual sustain/mute.
+            // No silence threshold, no voiceActive flag, no hard choke.
+            const float desiredGain=clamp(env/.018f,0.f,1.f);
+            masterGain += (desiredGain>masterGain?gainAttack:gainRelease)*(desiredGain-masterGain);
 
             float y=0.f;
             const float pp=clamp(p.pluck,.05f,.48f);
             for(int k=0;k<8;++k){
                 const float B=.000045f*(.35f+p.string);
-                const float r=(k+1)*std::sqrt(1+B*(k+1)*(k+1));
-                phase[k]+=2*pi*hz*r/sr;
-                if(phase[k]>2*pi) phase[k]-=2*pi;
+                const float harmonic=(k+1)*std::sqrt(1.f+B*(k+1)*(k+1));
+                phase[k]+=2*pi*bassHz*harmonic/sr;
+                while(phase[k]>2*pi) phase[k]-=2*pi;
 
                 const float tau=(1.20f+2.45f*p.body)/
-                    (1+.32f*k*(.5f+p.string)+.28f*p.damping*k);
+                    (1.f+.32f*k*(.5f+p.string)+.28f*p.damping*k);
                 amp[k]*=std::exp(-1.f/(tau*(float)sr));
 
-                y+=(float)std::sin(phase[k])*amp[k]*
-                    (.55f+.45f*std::fabs((float)std::sin(pi*(k+1)*pp)));
+                const float pluckWeight=.55f+.45f*std::fabs((float)std::sin(pi*(k+1)*pp));
+                y+=(float)std::sin(phase[k])*amp[k]*pluckWeight;
             }
 
-            const float fc=1500.f+4000.f*p.tone*(1-.22f*p.damping);
-            const float a=1-(float)std::exp(-2*pi*fc/sr);
-            lp+=a*(y-lp);
+            // Smoothly couple the synthesized sustain to the DI envelope.
+            y*=masterGain;
+
+            const float fc=1500.f+4000.f*p.tone*(1.f-.22f*p.damping);
+            const float fa=1.f-(float)std::exp(-2*pi*fc/sr);
+            lp+=fa*(y-lp);
             y=lp;
 
             const float drive=1.25f+1.75f*p.body;
             y=std::tanh(y*drive)/std::tanh(drive);
 
-            // Hard floor prevents denormal/residual hiss after the synthetic voice is killed.
-            if(!voiceActive || std::fabs(y)<1e-7f) y=0.f;
-            out[i]=(1-p.mix)*x+p.mix*.52f*y;
+            // DC blocker instead of hard-zeroing tiny samples.
+            const float dc=y-dcX+.995f*dcY;
+            dcX=y; dcY=dc;
+
+            out[i]=(1.f-p.mix)*x+p.mix*.52f*dc;
         }
     }
 };
