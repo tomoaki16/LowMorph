@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -13,146 +14,190 @@ struct Params {
 class Core {
     double sr=48000.0;
     Params p{};
-    std::vector<float> hist;
-    size_t w=0;
-    int hop=0;
 
-    float env=0.f, fastEnv=0.f, slowEnv=0.f, prevFast=0.f;
-    float hz=41.2f, target=41.2f, lp=0.f;
-    double phase[8]{};
-    float amp[8]{};
+    // Low-latency monophonic period tracker. No block autocorrelation, FFT, or look-ahead.
+    float det1=0.f, det2=0.f, detEnv=0.f;
+    bool schmittHigh=false;
+    int samplesSinceRise=0;
+    std::array<int,3> periods{{0,0,0}};
+    int periodCount=0, periodPos=0;
+    float inputHz=82.4f, targetHz=41.2f, modelHz=41.2f;
+    bool pitchValid=false;
 
-    int retriggerSamples=0;
-    int silenceSamples=0;
-    bool voiceActive=false;
+    // Continuous performance controls.
+    float inputEnv=0.f, fastEnv=0.f, slowEnv=0.f, prevFast=0.f;
+    float articulation=0.f;   // smooth excitation amount
+    float contact=1.f;        // smooth finger/mute loss
+    int excitationLeft=0;
+
+    // One-delay-loop waveguide / extended Karplus-Strong string.
+    std::vector<float> delay;
+    int writePos=0;
+    float lossState=0.f, pickupState=0.f, dcX=0.f, dcY=0.f;
+    uint32_t rng=0x12345678u;
 
     static float clamp(float x,float a,float b){ return std::max(a,std::min(b,x)); }
+    static float median3(float a,float b,float c){
+        return std::max(std::min(a,b),std::min(std::max(a,b),c));
+    }
+    float noise(){
+        rng ^= rng<<13; rng ^= rng>>17; rng ^= rng<<5;
+        return ((rng & 0x00ffffffu)/8388608.f)-1.f;
+    }
 
-    void analyse() {
-        const int N=(int)hist.size();
-        const int lo=(int)(sr/400.0);
-        const int hi=std::min((int)(sr/70.0),N/2);
-        int bestLag=lo;
-        float best=-1.f;
-        for(int lag=lo;lag<=hi;++lag){
-            double xy=0,xx=0,yy=0;
-            for(int j=0;j<N-lag;++j){
-                const float a=hist[(w+j)%N], b=hist[(w+j+lag)%N];
-                xy+=a*b; xx+=a*a; yy+=b*b;
+    void updatePitch(float x){
+        // Two cascaded one-pole LPFs suppress upper guitar harmonics before edge timing.
+        const float fc=330.f;
+        const float a=1.f-(float)std::exp(-2.0*3.14159265358979323846*fc/sr);
+        det1 += a*(x-det1);
+        det2 += a*(det1-det2);
+
+        const float absd=std::fabs(det2);
+        const float ea=1.f-(float)std::exp(-1.0/(.006*sr));
+        const float er=1.f-(float)std::exp(-1.0/(.050*sr));
+        detEnv += (absd>detEnv?ea:er)*(absd-detEnv);
+        ++samplesSinceRise;
+
+        // Adaptive Schmitt trigger: hysteresis follows the filtered signal level.
+        const float th=std::max(.0008f,detEnv*.16f);
+        if(!schmittHigh && det2>th){
+            schmittHigh=true;
+            const int period=samplesSinceRise;
+            samplesSinceRise=0;
+            const int minP=(int)(sr/430.0);
+            const int maxP=(int)(sr/65.0);
+            if(period>=minP && period<=maxP){
+                periods[periodPos]=period;
+                periodPos=(periodPos+1)%3;
+                periodCount=std::min(periodCount+1,3);
+                if(periodCount>=2){
+                    float chosen=(float)periods[(periodPos+2)%3];
+                    if(periodCount==3)
+                        chosen=median3((float)periods[0],(float)periods[1],(float)periods[2]);
+                    const float candidate=(float)(sr/chosen);
+                    // Reject implausible single-edge octave jumps; accept sustained changes quickly.
+                    if(!pitchValid || (candidate>inputHz*.62f && candidate<inputHz*1.62f)){
+                        inputHz=candidate;
+                        targetHz=clamp(inputHz*.5f,35.f,220.f);
+                        pitchValid=true;
+                    } else {
+                        inputHz += .18f*(candidate-inputHz);
+                        targetHz=clamp(inputHz*.5f,35.f,220.f);
+                    }
+                }
             }
-            const float c=(float)(xy/(std::sqrt(xx*yy)+1e-12));
-            if(c>best){ best=c; bestLag=lag; }
+        } else if(schmittHigh && det2 < -th) {
+            schmittHigh=false;
         }
-        if(best>.55f)
-            target=clamp((float)(sr/bestLag)*.5f,35.f,220.f);
+
+        if(samplesSinceRise>(int)(sr*.060)){
+            pitchValid=false;
+            periodCount=0;
+        }
     }
 
-    void trigger(float strength) {
-        static constexpr float A[8]={1.f,.58f,.39f,.27f,.19f,.13f,.09f,.06f};
-        const float v=clamp(strength, .10f, 1.f);
-        // A new pick replaces the previous excitation instead of waiting for the old note to decay.
-        for(int k=0;k<8;++k) amp[k]=v*A[k];
-        voiceActive=true;
-        silenceSamples=0;
-        retriggerSamples=(int)(sr*.018); // only reject double-triggering inside ~18 ms
-    }
-
-    void choke() {
-        // Guitar mute should stop the synthetic string too; do not leave autonomous oscillators ringing.
-        for(float &a : amp) a*=0.82f;
-        lp*=0.82f;
-        bool alive=false;
-        for(float a : amp) if(a>1e-5f){ alive=true; break; }
-        if(!alive){
-            std::fill(amp,amp+8,0.f);
-            lp=0.f;
-            voiceActive=false;
-        }
+    float readDelay(float d) const {
+        const int size=(int)delay.size();
+        float rp=(float)writePos-d;
+        while(rp<0) rp+=size;
+        const int i0=(int)rp;
+        const int i1=(i0+1)%size;
+        const float f=rp-i0;
+        return delay[i0]+f*(delay[i1]-delay[i0]);
     }
 
 public:
-    void prepare(double s){ sr=s; hist.assign((size_t)(sr*.045),0.f); reset(); }
+    void prepare(double s){
+        sr=s;
+        delay.assign((size_t)(sr/30.0)+8,0.f);
+        reset();
+    }
 
     void reset(){
-        std::fill(hist.begin(),hist.end(),0.f);
-        w=0; hop=0;
-        env=fastEnv=slowEnv=prevFast=0.f;
-        hz=target=41.2f; lp=0.f;
-        retriggerSamples=silenceSamples=0;
-        voiceActive=false;
-        std::fill(phase,phase+8,0.0);
-        std::fill(amp,amp+8,0.f);
+        std::fill(delay.begin(),delay.end(),0.f);
+        writePos=0; det1=det2=detEnv=0.f; schmittHigh=false; samplesSinceRise=0;
+        periods={{0,0,0}}; periodCount=periodPos=0;
+        inputHz=82.4f; targetHz=modelHz=41.2f; pitchValid=false;
+        inputEnv=fastEnv=slowEnv=prevFast=articulation=0.f; contact=1.f;
+        excitationLeft=0; lossState=pickupState=dcX=dcY=0.f; rng=0x12345678u;
     }
 
     void set(const Params&v){ p=v; }
-    float detectedHz()const{return hz;}
+    float detectedHz()const{return modelHz;}
 
     void process(const float*in,float*out,int n){
-        constexpr double pi=3.14159265358979323846;
-        const float envAttack=std::exp(-1.f/(.0015f*(float)sr));
-        const float envRelease=std::exp(-1.f/(.028f*(float)sr));
-        const float fastCoef=std::exp(-1.f/(.0007f*(float)sr));
-        const float slowCoef=std::exp(-1.f/(.018f*(float)sr));
-        const int muteHold=(int)(sr*.012); // require ~12 ms of near-silence before choking
+        const float envA=1.f-(float)std::exp(-1.0/(.0015*sr));
+        const float envR=1.f-(float)std::exp(-1.0/(.035*sr));
+        const float fastA=1.f-(float)std::exp(-1.0/(.00055*sr));
+        const float slowA=1.f-(float)std::exp(-1.0/(.018*sr));
+        const float contactCoef=1.f-(float)std::exp(-1.0/(.018*sr));
+        const float artRelease=1.f-(float)std::exp(-1.0/(.030*sr));
 
         for(int i=0;i<n;++i){
             const float x=in[i];
-            hist[w]=x; w=(w+1)%hist.size();
-            const float q=std::fabs(x);
+            const float ax=std::fabs(x);
+            updatePitch(x);
 
-            env = q>env ? envAttack*env+(1-envAttack)*q
-                        : envRelease*env+(1-envRelease)*q;
-            fastEnv = fastCoef*fastEnv+(1-fastCoef)*q;
-            slowEnv = slowCoef*slowEnv+(1-slowCoef)*q;
-
-            // Attack detector: respond to the positive transient slope, not the residual note envelope.
+            inputEnv += (ax>inputEnv?envA:envR)*(ax-inputEnv);
+            fastEnv += fastA*(ax-fastEnv);
+            slowEnv += slowA*(ax-slowEnv);
             const float slope=fastEnv-prevFast;
             prevFast=fastEnv;
-            if(retriggerSamples>0) --retriggerSamples;
 
-            const float dynamicThreshold=std::max(.0025f, slowEnv*.08f);
-            const bool transient = slope>dynamicThreshold && fastEnv>std::max(.006f, slowEnv*1.06f);
-            if(transient && retriggerSamples==0)
-                trigger(clamp(fastEnv*8.f,.10f,1.f));
-
-            if(++hop>=std::max(1,(int)(sr*.006))){
-                hop=0;
-                if(env>.004f) analyse();
+            // Onsets only inject energy. They never hard-reset or hard-stop the resonator.
+            const float onsetThreshold=std::max(.00045f,slowEnv*.018f);
+            if(slope>onsetThreshold && fastEnv>std::max(.0025f,slowEnv*1.025f)){
+                articulation=std::max(articulation,clamp(fastEnv*9.f,.08f,1.f));
+                excitationLeft=std::max(excitationLeft,(int)(sr*(.0025+.0045*p.attack)));
             }
-            hz += .006f*(target-hz);
+            articulation += artRelease*(0.f-articulation);
 
-            // Detect a real left-hand/right-hand mute from the DI input.
-            if(q<.0012f && env<.0045f) ++silenceSamples;
-            else silenceSamples=0;
-            if(voiceActive && silenceSamples>muteHold) choke();
+            // Finger mute is a continuous loss control, not a gate.
+            const float energyNorm=clamp(inputEnv/.020f,0.f,1.f);
+            const float desiredContact=energyNorm;
+            contact += contactCoef*(desiredContact-contact);
 
-            float y=0.f;
-            const float pp=clamp(p.pluck,.05f,.48f);
-            for(int k=0;k<8;++k){
-                const float B=.000045f*(.35f+p.string);
-                const float r=(k+1)*std::sqrt(1+B*(k+1)*(k+1));
-                phase[k]+=2*pi*hz*r/sr;
-                if(phase[k]>2*pi) phase[k]-=2*pi;
+            // Smooth pitch motion; repeated notes start immediately at the previous valid pitch.
+            const float pitchCoef=1.f-(float)std::exp(-1.0/(.0045*sr));
+            if(pitchValid) modelHz += pitchCoef*(targetHz-modelHz);
 
-                const float tau=(1.20f+2.45f*p.body)/
-                    (1+.32f*k*(.5f+p.string)+.28f*p.damping*k);
-                amp[k]*=std::exp(-1.f/(tau*(float)sr));
+            const float delaySamples=clamp((float)(sr/modelHz)-.5f,8.f,(float)delay.size()-3.f);
+            float loop=readDelay(delaySamples);
 
-                y+=(float)std::sin(phase[k])*amp[k]*
-                    (.55f+.45f*std::fabs((float)std::sin(pi*(k+1)*pp)));
+            // Frequency-dependent loss: treble dies faster, while mute increases broadband loss smoothly.
+            const float lossFc=900.f+4200.f*p.tone;
+            const float la=1.f-(float)std::exp(-2.0*3.14159265358979323846*lossFc/sr);
+            lossState += la*(loop-lossState);
+
+            const float openFeedback=.9978f-.0022f*p.damping;
+            const float muteLoss=.955f+.044f*contact;
+            const float feedback=clamp(openFeedback*muteLoss,.90f,.9994f);
+
+            float excite=0.f;
+            if(excitationLeft>0){
+                --excitationLeft;
+                // Band-limited-ish excitation: DI transient supplies playing character,
+                // noise supplies string broadband energy without copying guitar sustain.
+                const float transient=x-det2;
+                excite=(.55f*transient+.018f*noise())*articulation*(.55f+.75f*p.attack);
             }
 
-            const float fc=1500.f+4000.f*p.tone*(1-.22f*p.damping);
-            const float a=1-(float)std::exp(-2*pi*fc/sr);
-            lp+=a*(y-lp);
-            y=lp;
+            const float next=feedback*lossState+excite;
+            delay[writePos]=clamp(next,-1.4f,1.4f);
+            writePos=(writePos+1)%delay.size();
 
-            const float drive=1.25f+1.75f*p.body;
-            y=std::tanh(y*drive)/std::tanh(drive);
+            // Pickup/body stage. No discontinuous zeroing anywhere in the audio path.
+            const float bodyFc=650.f+2600.f*p.body;
+            const float ba=1.f-(float)std::exp(-2.0*3.14159265358979323846*bodyFc/sr);
+            pickupState += ba*(loop-pickupState);
+            float y=pickupState;
 
-            // Hard floor prevents denormal/residual hiss after the synthetic voice is killed.
-            if(!voiceActive || std::fabs(y)<1e-7f) y=0.f;
-            out[i]=(1-p.mix)*x+p.mix*.52f*y;
+            // DC blocker for stable silence and no residual step/click.
+            const float dc=y-dcX+.995f*dcY;
+            dcX=y; dcY=dc;
+            y=std::tanh(dc*(1.05f+1.15f*p.body));
+
+            out[i]=(1.f-p.mix)*x+p.mix*.72f*y;
         }
     }
 };
